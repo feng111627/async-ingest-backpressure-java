@@ -24,6 +24,12 @@ public class IngestProperties {
     /** 重试间隔基数，实际等待按次数线性放大。 */
     private Duration retryBackoff = Duration.ofMillis(50);
 
+    /**
+     * 键熔断后的冷却时间。冷却期内该键提交快速失败；冷却结束后放行一条试探请求，
+     * 试探成功则恢复该键，试探失败则重新进入冷却。
+     */
+    private Duration circuitCooldown = Duration.ofSeconds(30);
+
     /** 处理线程池大小，不同键之间并行推进的并发度。 */
     private int workerThreads = 8;
 
@@ -73,6 +79,14 @@ public class IngestProperties {
 
     public void setRetryBackoff(Duration retryBackoff) {
         this.retryBackoff = retryBackoff;
+    }
+
+    public Duration getCircuitCooldown() {
+        return circuitCooldown;
+    }
+
+    public void setCircuitCooldown(Duration circuitCooldown) {
+        this.circuitCooldown = circuitCooldown;
     }
 
     public int getWorkerThreads() {

@@ -29,8 +29,9 @@ import org.springframework.stereotype.Service;
  *       由共享线程池并行推进，某个键卡住（下游慢/重试）不会拖慢其它键。</li>
  *   <li>全局待处理量（排队中 + 处理中）由信号量限流，达到上限后按策略排队（BLOCK）
  *       或拒绝（REJECT），拒绝原因显式可区分，绝不静默丢弃。</li>
- *   <li>下游失败按配置次数重试；重试耗尽后该键熔断，后续提交快速失败，
- *       已排在该键队列中的请求以 FAILED_KEY_CIRCUIT_OPEN 显式完成。</li>
+ *   <li>下游失败按配置次数重试；重试耗尽后该键熔断进入冷却期，冷却期内后续提交快速失败，
+ *       已排在该键队列中的请求以 FAILED_KEY_CIRCUIT_OPEN 显式完成。冷却结束后放行一条
+ *       试探请求：试探成功则恢复该键，试探失败则重新冷却，期间不会向下游堆积更多请求。</li>
  *   <li>关闭时停止接收新请求，等待已接收数据在超时时间内排空；
  *       超时则明确报告未处理完的请求。下游写入按 requestId 幂等，重试不会写重。</li>
  * </ul>
@@ -64,15 +65,29 @@ public class IngestService {
             return reject(RejectReason.SHUTTING_DOWN, "ingest channel is shutting down");
         }
         KeyLane lane = lanes.computeIfAbsent(request.key(), k -> new KeyLane());
+        boolean probe = false;
         if (lane.circuitOpen.get()) {
-            return reject(RejectReason.KEY_CIRCUIT_OPEN,
-                    "key '" + request.key() + "' failed permanently after retries exhausted");
+            long retryAfter = lane.circuitReopenAtMillis - System.currentTimeMillis();
+            if (retryAfter > 0) {
+                // 冷却期内：保持快速失败
+                return reject(RejectReason.KEY_CIRCUIT_OPEN,
+                        "key '" + request.key() + "' circuit open, retry after " + retryAfter + "ms");
+            }
+            // 冷却结束：CAS 保证只放行一条试探请求，其余继续快速失败
+            if (!lane.probeInFlight.compareAndSet(false, true)) {
+                return reject(RejectReason.KEY_CIRCUIT_OPEN,
+                        "key '" + request.key() + "' circuit half-open, probe already in flight");
+            }
+            probe = true;
         }
         if (!acquirePermit()) {
+            if (probe) {
+                lane.probeInFlight.set(false);
+            }
             return reject(rejectReason(),
                     "pending limit " + properties.getMaxPending() + " reached");
         }
-        PendingTask task = new PendingTask(request);
+        PendingTask task = new PendingTask(request, probe);
         lane.queue.add(task);
         lane.lastActivityMillis = System.currentTimeMillis();
         metrics.onAccepted();
@@ -126,7 +141,7 @@ public class IngestService {
                     }
                     return;
                 }
-                if (lane.circuitOpen.get()) {
+                if (lane.circuitOpen.get() && !task.probe) {
                     complete(lane, task, OutcomeStatus.FAILED_KEY_CIRCUIT_OPEN,
                             "key circuit open, dropped without attempting downstream");
                     continue;
@@ -148,6 +163,13 @@ public class IngestService {
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                 try {
                     store.write(task.request);
+                    if (task.probe) {
+                        // 试探成功：恢复该键，后续请求照常处理
+                        lane.circuitOpen.set(false);
+                        lane.probeInFlight.set(false);
+                        log.info("key '{}' circuit closed: probe request {} succeeded",
+                                task.request.key(), task.request.requestId());
+                    }
                     complete(lane, task, OutcomeStatus.SUCCESS,
                             attempt > 1 ? "ok after " + attempt + " attempts" : "ok");
                     return;
@@ -161,8 +183,11 @@ public class IngestService {
             }
             complete(lane, task, OutcomeStatus.FAILED_RETRY_EXHAUSTED,
                     "downstream still failing after " + maxAttempts + " attempts");
-            // 重试耗尽：熔断该键，后续提交快速失败；队列中剩余的请求显式失败
+            // 重试耗尽：熔断该键并进入冷却期，后续提交快速失败；队列中剩余的请求显式失败。
+            // 试探请求失败同样走这里：重新冷却，不再放行更多请求，避免给下游堆压力。
             lane.circuitOpen.set(true);
+            lane.circuitReopenAtMillis = System.currentTimeMillis() + properties.getCircuitCooldown().toMillis();
+            lane.probeInFlight.set(false);
         } finally {
             lane.processing.decrementAndGet();
             inFlight.remove(task);
@@ -255,7 +280,7 @@ public class IngestService {
                 lane.queue.size(),
                 lane.processing.get(),
                 lane.circuitOpen.get(),
-                0,
+                lane.circuitOpen.get() ? Math.max(0, lane.circuitReopenAtMillis - now) : 0,
                 lane.succeeded.get())));
         return List.copyOf(stats);
     }
@@ -264,6 +289,10 @@ public class IngestService {
         final ConcurrentLinkedQueue<PendingTask> queue = new ConcurrentLinkedQueue<>();
         final AtomicBoolean scheduled = new AtomicBoolean();
         final AtomicBoolean circuitOpen = new AtomicBoolean();
+        /** 半开状态下是否已有一条试探请求在飞，保证一次只放一条。 */
+        final AtomicBoolean probeInFlight = new AtomicBoolean();
+        /** 熔断冷却截止时刻（epoch millis），到点后允许一条试探请求通过。 */
+        volatile long circuitReopenAtMillis;
         /** 正在处理（含重试中）的请求数。 */
         final AtomicInteger processing = new AtomicInteger();
         /** 该键已成功写入下游的请求总数。 */
@@ -274,10 +303,13 @@ public class IngestService {
 
     private static final class PendingTask {
         final WriteRequest request;
+        /** 是否为熔断冷却结束后的试探请求。 */
+        final boolean probe;
         final CompletableFuture<WriteOutcome> outcome = new CompletableFuture<>();
 
-        PendingTask(WriteRequest request) {
+        PendingTask(WriteRequest request, boolean probe) {
             this.request = request;
+            this.probe = probe;
         }
     }
 }
