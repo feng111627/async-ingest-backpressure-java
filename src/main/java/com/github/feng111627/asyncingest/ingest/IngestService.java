@@ -3,7 +3,9 @@ package com.github.feng111627.asyncingest.ingest;
 import com.github.feng111627.asyncingest.config.IngestProperties;
 import jakarta.annotation.PreDestroy;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -11,6 +13,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -48,6 +51,7 @@ public class IngestService {
     private final Set<PendingTask> inFlight = ConcurrentHashMap.newKeySet();
     private final IngestMetrics metrics = new IngestMetrics();
     private final ExecutorService workers;
+    private final ScheduledExecutorService sweeper;
     private volatile boolean accepting = true;
 
     public IngestService(IngestProperties properties, DownstreamStore store) {
@@ -55,6 +59,14 @@ public class IngestService {
         this.store = store;
         this.pendingPermits = new Semaphore(properties.getMaxPending());
         this.workers = Executors.newFixedThreadPool(properties.getWorkerThreads());
+        this.sweeper = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread thread = new Thread(r, "ingest-key-evictor");
+            thread.setDaemon(true);
+            return thread;
+        });
+        long intervalMillis = properties.getEvictionInterval().toMillis();
+        this.sweeper.scheduleWithFixedDelay(this::evictIdleKeysSafely,
+                intervalMillis, intervalMillis, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -88,8 +100,18 @@ public class IngestService {
                     "pending limit " + properties.getMaxPending() + " reached");
         }
         PendingTask task = new PendingTask(request, probe);
-        lane.queue.add(task);
-        lane.lastActivityMillis = System.currentTimeMillis();
+        synchronized (lane) {
+            if (lane.evicted) {
+                // 拿到 lane 后它刚好被回收：释放许可与试探名额，按新键重新走一遍流程
+                pendingPermits.release();
+                if (probe) {
+                    lane.probeInFlight.set(false);
+                }
+                return submit(request);
+            }
+            lane.queue.add(task);
+            lane.lastActivityMillis = System.currentTimeMillis();
+        }
         metrics.onAccepted();
         schedule(lane);
         return SubmitResult.accepted(task.outcome);
@@ -223,6 +245,7 @@ public class IngestService {
     @PreDestroy
     public List<WriteRequest> shutdown() {
         accepting = false;
+        sweeper.shutdownNow();
         boolean drained;
         try {
             // 拿满全部许可即说明没有排队/处理中的请求
@@ -252,6 +275,58 @@ public class IngestService {
         }
         workers.shutdown();
         return leftovers;
+    }
+
+    /**
+     * 空闲键状态回收。只回收"空队列 + 无处理中 + 无调度中"的 lane，
+     * 正在处理的请求不受影响；回收不触碰任何已接收数据，只是丢弃该键的运行状态
+     * （熔断标记、成功计数等），之后同键提交按新键处理。
+     */
+    private void evictIdleKeysSafely() {
+        try {
+            evictIdleKeys();
+        } catch (Throwable t) {
+            log.warn("idle key eviction sweep failed", t);
+        }
+    }
+
+    private void evictIdleKeys() {
+        long now = System.currentTimeMillis();
+        long idleMillis = properties.getKeyIdleTimeout().toMillis();
+        lanes.forEach((key, lane) -> {
+            if (now - lane.lastActivityMillis >= idleMillis) {
+                tryEvict(key, lane);
+            }
+        });
+        // 超出键数上限时，优先回收最久未活动的空闲键
+        int excess = lanes.size() - properties.getMaxKeys();
+        if (excess > 0) {
+            lanes.entrySet().stream()
+                    .filter(entry -> isIdle(entry.getValue()))
+                    .sorted(Comparator.comparingLong(entry -> entry.getValue().lastActivityMillis))
+                    .limit(excess)
+                    .forEach(entry -> tryEvict(entry.getKey(), entry.getValue()));
+        }
+    }
+
+    /** lane 空闲的判定：无排队、无处理中、无调度中的 drain。 */
+    private boolean isIdle(KeyLane lane) {
+        return lane.queue.isEmpty() && lane.processing.get() == 0 && !lane.scheduled.get();
+    }
+
+    /**
+     * 与 submit 的入队共用 lane 监视器互斥：要么入队在前（lane 不再空闲，放弃回收），
+     * 要么回收在前（submit 看到 evicted 标记后换新 lane 重试），不会丢请求。
+     */
+    private void tryEvict(String key, KeyLane lane) {
+        synchronized (lane) {
+            if (!isIdle(lane)) {
+                return;
+            }
+            lane.evicted = true;
+            lanes.remove(key, lane);
+            log.debug("evicted idle state of key '{}'", key);
+        }
     }
 
     /** 当前待处理量（排队中 + 处理中），用于监控与测试。 */
@@ -299,6 +374,8 @@ public class IngestService {
         final AtomicLong succeeded = new AtomicLong();
         /** 最近一次提交或处理完成的时间，用于空闲状态回收。 */
         volatile long lastActivityMillis = System.currentTimeMillis();
+        /** 是否已被回收：回收后 submit 不得再向该 lane 入队，需换新 lane。 */
+        volatile boolean evicted;
     }
 
     private static final class PendingTask {

@@ -36,6 +36,15 @@ public class IngestProperties {
     /** 收到关闭信号后等待已接收数据处理完的最长时间。 */
     private Duration shutdownTimeout = Duration.ofSeconds(10);
 
+    /** 键空闲（无排队、无处理中请求）多久后回收其运行状态。 */
+    private Duration keyIdleTimeout = Duration.ofMinutes(10);
+
+    /** 最多保留运行状态的业务键数量，超出后优先回收最久未活动的空闲键。 */
+    private int maxKeys = 10_000;
+
+    /** 空闲键回收的扫描间隔。 */
+    private Duration evictionInterval = Duration.ofMinutes(1);
+
     public enum BackpressureStrategy {
         REJECT,
         BLOCK
@@ -103,5 +112,29 @@ public class IngestProperties {
 
     public void setShutdownTimeout(Duration shutdownTimeout) {
         this.shutdownTimeout = shutdownTimeout;
+    }
+
+    public Duration getKeyIdleTimeout() {
+        return keyIdleTimeout;
+    }
+
+    public void setKeyIdleTimeout(Duration keyIdleTimeout) {
+        this.keyIdleTimeout = keyIdleTimeout;
+    }
+
+    public int getMaxKeys() {
+        return maxKeys;
+    }
+
+    public void setMaxKeys(int maxKeys) {
+        this.maxKeys = maxKeys;
+    }
+
+    public Duration getEvictionInterval() {
+        return evictionInterval;
+    }
+
+    public void setEvictionInterval(Duration evictionInterval) {
+        this.evictionInterval = evictionInterval;
     }
 }
