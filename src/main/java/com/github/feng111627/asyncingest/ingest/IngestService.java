@@ -14,6 +14,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -43,6 +45,7 @@ public class IngestService {
     private final Semaphore pendingPermits;
     private final ConcurrentMap<String, KeyLane> lanes = new ConcurrentHashMap<>();
     private final Set<PendingTask> inFlight = ConcurrentHashMap.newKeySet();
+    private final IngestMetrics metrics = new IngestMetrics();
     private final ExecutorService workers;
     private volatile boolean accepting = true;
 
@@ -58,21 +61,28 @@ public class IngestService {
      */
     public SubmitResult submit(WriteRequest request) {
         if (!accepting) {
-            return SubmitResult.rejected(RejectReason.SHUTTING_DOWN, "ingest channel is shutting down");
+            return reject(RejectReason.SHUTTING_DOWN, "ingest channel is shutting down");
         }
         KeyLane lane = lanes.computeIfAbsent(request.key(), k -> new KeyLane());
         if (lane.circuitOpen.get()) {
-            return SubmitResult.rejected(RejectReason.KEY_CIRCUIT_OPEN,
+            return reject(RejectReason.KEY_CIRCUIT_OPEN,
                     "key '" + request.key() + "' failed permanently after retries exhausted");
         }
         if (!acquirePermit()) {
-            return SubmitResult.rejected(rejectReason(),
+            return reject(rejectReason(),
                     "pending limit " + properties.getMaxPending() + " reached");
         }
         PendingTask task = new PendingTask(request);
         lane.queue.add(task);
+        lane.lastActivityMillis = System.currentTimeMillis();
+        metrics.onAccepted();
         schedule(lane);
         return SubmitResult.accepted(task.outcome);
+    }
+
+    private SubmitResult reject(RejectReason reason, String detail) {
+        metrics.onRejected(reason);
+        return SubmitResult.rejected(reason, detail);
     }
 
     private boolean acquirePermit() {
@@ -117,7 +127,7 @@ public class IngestService {
                     return;
                 }
                 if (lane.circuitOpen.get()) {
-                    complete(task, OutcomeStatus.FAILED_KEY_CIRCUIT_OPEN,
+                    complete(lane, task, OutcomeStatus.FAILED_KEY_CIRCUIT_OPEN,
                             "key circuit open, dropped without attempting downstream");
                     continue;
                 }
@@ -132,12 +142,14 @@ public class IngestService {
 
     private void process(KeyLane lane, PendingTask task) {
         inFlight.add(task);
+        lane.processing.incrementAndGet();
         try {
             int maxAttempts = properties.getMaxRetries() + 1;
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                 try {
                     store.write(task.request);
-                    complete(task, OutcomeStatus.SUCCESS, attempt > 1 ? "ok after " + attempt + " attempts" : "ok");
+                    complete(lane, task, OutcomeStatus.SUCCESS,
+                            attempt > 1 ? "ok after " + attempt + " attempts" : "ok");
                     return;
                 } catch (DownstreamException e) {
                     log.warn("downstream write failed, key={} requestId={} attempt={}/{}: {}",
@@ -147,11 +159,12 @@ public class IngestService {
                     }
                 }
             }
-            complete(task, OutcomeStatus.FAILED_RETRY_EXHAUSTED,
+            complete(lane, task, OutcomeStatus.FAILED_RETRY_EXHAUSTED,
                     "downstream still failing after " + maxAttempts + " attempts");
             // 重试耗尽：熔断该键，后续提交快速失败；队列中剩余的请求显式失败
             lane.circuitOpen.set(true);
         } finally {
+            lane.processing.decrementAndGet();
             inFlight.remove(task);
         }
     }
@@ -167,8 +180,13 @@ public class IngestService {
         }
     }
 
-    private void complete(PendingTask task, OutcomeStatus status, String detail) {
+    private void complete(KeyLane lane, PendingTask task, OutcomeStatus status, String detail) {
         task.outcome.complete(new WriteOutcome(task.request.requestId(), task.request.key(), status, detail));
+        metrics.onOutcome(status);
+        if (status == OutcomeStatus.SUCCESS) {
+            lane.succeeded.incrementAndGet();
+        }
+        lane.lastActivityMillis = System.currentTimeMillis();
         pendingPermits.release();
     }
 
@@ -198,7 +216,7 @@ public class IngestService {
             for (KeyLane lane : lanes.values()) {
                 PendingTask task;
                 while ((task = lane.queue.poll()) != null) {
-                    complete(task, OutcomeStatus.NOT_PROCESSED_SHUTDOWN_TIMEOUT,
+                    complete(lane, task, OutcomeStatus.NOT_PROCESSED_SHUTDOWN_TIMEOUT,
                             "shutdown timeout before processing");
                     leftovers.add(task.request);
                 }
@@ -216,10 +234,42 @@ public class IngestService {
         return properties.getMaxPending() - pendingPermits.availablePermits();
     }
 
+    /** 全局运行指标快照。 */
+    public IngestStats stats() {
+        return new IngestStats(
+                metrics.received(),
+                metrics.succeeded(),
+                metrics.failed(),
+                pendingCount(),
+                metrics.rejectedTotal(),
+                metrics.rejectedSnapshot(),
+                lanes.size());
+    }
+
+    /** 每个业务键当前的运行状态快照。 */
+    public List<KeyStats> keyStats() {
+        long now = System.currentTimeMillis();
+        List<KeyStats> stats = new ArrayList<>();
+        lanes.forEach((key, lane) -> stats.add(new KeyStats(
+                key,
+                lane.queue.size(),
+                lane.processing.get(),
+                lane.circuitOpen.get(),
+                0,
+                lane.succeeded.get())));
+        return List.copyOf(stats);
+    }
+
     private static final class KeyLane {
         final ConcurrentLinkedQueue<PendingTask> queue = new ConcurrentLinkedQueue<>();
         final AtomicBoolean scheduled = new AtomicBoolean();
         final AtomicBoolean circuitOpen = new AtomicBoolean();
+        /** 正在处理（含重试中）的请求数。 */
+        final AtomicInteger processing = new AtomicInteger();
+        /** 该键已成功写入下游的请求总数。 */
+        final AtomicLong succeeded = new AtomicLong();
+        /** 最近一次提交或处理完成的时间，用于空闲状态回收。 */
+        volatile long lastActivityMillis = System.currentTimeMillis();
     }
 
     private static final class PendingTask {
