@@ -228,13 +228,14 @@ public class IngestService {
     }
 
     private void complete(KeyLane lane, PendingTask task, OutcomeStatus status, String detail) {
-        task.outcome.complete(new WriteOutcome(task.request.requestId(), task.request.key(), status, detail));
+        // 先更新统计再完成 future：调用方拿到结果时，统计一定已反映该结果
         metrics.onOutcome(status);
         if (status == OutcomeStatus.SUCCESS) {
             lane.succeeded.incrementAndGet();
         }
         lane.lastActivityMillis = System.currentTimeMillis();
         pendingPermits.release();
+        task.outcome.complete(new WriteOutcome(task.request.requestId(), task.request.key(), status, detail));
     }
 
     /**
