@@ -1,14 +1,18 @@
 package com.github.feng111627.asyncingest.api;
 
 import com.github.feng111627.asyncingest.ingest.IngestService;
+import com.github.feng111627.asyncingest.ingest.IngestStats;
+import com.github.feng111627.asyncingest.ingest.KeyStats;
 import com.github.feng111627.asyncingest.ingest.RejectReason;
 import com.github.feng111627.asyncingest.ingest.SubmitResult;
 import com.github.feng111627.asyncingest.ingest.WriteOutcome;
 import com.github.feng111627.asyncingest.ingest.WriteRequest;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -66,6 +70,22 @@ public class IngestController {
                             "status", "REJECTED",
                             "reason", rejected.reason().name()));
         };
+    }
+
+    /**
+     * 全局运行指标：接收 / 成功 / 失败 / 待处理量 / 按原因细分的拒绝数。
+     */
+    @GetMapping("/stats")
+    public IngestStats stats() {
+        return ingestService.stats();
+    }
+
+    /**
+     * 每个业务键的运行状态：积压、是否熔断、距离下次试探的剩余时间、已成功写入数。
+     */
+    @GetMapping("/stats/keys")
+    public List<KeyStats> keyStats() {
+        return ingestService.keyStats();
     }
 
     private HttpStatus statusFor(RejectReason reason) {
