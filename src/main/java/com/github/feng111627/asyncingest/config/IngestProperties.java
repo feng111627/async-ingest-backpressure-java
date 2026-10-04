@@ -30,6 +30,18 @@ public class IngestProperties {
     /** 收到关闭信号后等待已接收数据处理完的最长时间。 */
     private Duration shutdownTimeout = Duration.ofSeconds(10);
 
+    /** 键熔断后的冷却时间，冷却结束后自动进入半开状态放行一条试探请求。 */
+    private Duration circuitCooldown = Duration.ofSeconds(30);
+
+    /** 最多保留多少个键的运行状态，超出后优先回收最久未活动的空闲键。 */
+    private int maxKeys = 10_000;
+
+    /** 键空闲（无排队、无处理中、无新提交）超过该时长后，其运行状态可被回收。 */
+    private Duration keyIdleTimeout = Duration.ofMinutes(10);
+
+    /** 空闲键回收任务的扫描间隔。 */
+    private Duration reapInterval = Duration.ofSeconds(30);
+
     public enum BackpressureStrategy {
         REJECT,
         BLOCK
@@ -89,5 +101,37 @@ public class IngestProperties {
 
     public void setShutdownTimeout(Duration shutdownTimeout) {
         this.shutdownTimeout = shutdownTimeout;
+    }
+
+    public Duration getCircuitCooldown() {
+        return circuitCooldown;
+    }
+
+    public void setCircuitCooldown(Duration circuitCooldown) {
+        this.circuitCooldown = circuitCooldown;
+    }
+
+    public int getMaxKeys() {
+        return maxKeys;
+    }
+
+    public void setMaxKeys(int maxKeys) {
+        this.maxKeys = maxKeys;
+    }
+
+    public Duration getKeyIdleTimeout() {
+        return keyIdleTimeout;
+    }
+
+    public void setKeyIdleTimeout(Duration keyIdleTimeout) {
+        this.keyIdleTimeout = keyIdleTimeout;
+    }
+
+    public Duration getReapInterval() {
+        return reapInterval;
+    }
+
+    public void setReapInterval(Duration reapInterval) {
+        this.reapInterval = reapInterval;
     }
 }
